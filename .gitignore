@@ -1,0 +1,7 @@
+# Se regenera al ejecutar el notebook
+lake/
+rendimiento.png
+
+.venv/
+__pycache__/
+.ipynb_checkpoints/
