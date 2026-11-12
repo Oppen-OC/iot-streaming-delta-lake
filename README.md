@@ -4,7 +4,7 @@ Vehicle telemetry is streamed with Spark Structured Streaming into cleaned, city
 
 ![Apache Spark 3.5](https://img.shields.io/badge/Apache%20Spark-3.5-E25A1C)
 ![Delta Lake 3.2](https://img.shields.io/badge/Delta%20Lake-3.2-00ADD8)
-![Databricks](https://img.shields.io/badge/Databricks-FF3621)
+![Databricks serverless](https://img.shields.io/badge/Databricks-serverless-FF3621)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
 The notebooks, `informe.md`, `generador.py` and the screenshots are in Spanish; this README is the English entry point.
@@ -14,7 +14,7 @@ The notebooks, `informe.md`, `generador.py` and the screenshots are in Spanish; 
 From the full run on Databricks serverless compute (Spark 4.2.0); the full validation report is [informe.md](informe.md).
 
 - **No rows lost.** The generator wrote 13,204 events in 26 JSON files and bronze read all 13,204. They split into 11,931 silver rows, 1,069 quarantined rows and 204 duplicates removed. The row reconciliation difference is 0.
-- **Cleaning matches the injected faults exactly.** For each of the six rules, the number of faulty records the generator injected equals the number the pipeline quarantined (191, 196, 126, 182, 131 and 243). Re-applying the rules to the written silver table finds 0 violations.
+- **Cleaning matches the injected faults exactly.** For each of the six rules, the number of faulty records the generator injected equals the number the pipeline quarantined (1,069 rows in total, per-rule counts in the table below). Re-applying the rules to the written silver table finds 0 violations.
 - **Partitioned by city.** Silver has one folder per city (Barcelona, Bilbao, Madrid, Sevilla, Valencia), holding between 2,319 and 2,520 rows each.
 - **Delta features exercised.** `OPTIMIZE` compacted silver from 15 files to 5, and time travel read the table back at version 0 (4,132 rows), version 1 (8,250 rows) and version 3 (11,931 rows).
 
@@ -24,7 +24,7 @@ Bronze keeps the raw events, anomalies included. Silver and quarantine are produ
 
 ```mermaid
 flowchart LR
-  gen["generador.py<br/>simulated fleet built on real VED data"] -->|JSON files| landing
+  gen["Generator<br/>(generador.py locally,<br/>embedded on Databricks)<br/>simulated fleet built on real VED data"] -->|JSON files| landing
   landing["landing<br/>raw JSON files"] -->|readStream, explicit schema| bronce
   bronce["bronce<br/>raw events, anomalies included"] --> dedup
   dedup["watermark 10 min +<br/>dropDuplicates on event_id"] --> rules
@@ -38,14 +38,23 @@ flowchart LR
 
 The six cleaning rules, as implemented in the silver step. A row that breaks several rules gets all of their labels.
 
-| Rule | Rejected when | Label |
-|---|---|---|
-| Speed | empty, negative or above 200 km/h | `VELOCIDAD_ABSURDA` |
-| Coordinates | empty or outside the range of the Earth | `COORDENADA_IMPOSIBLE` |
-| Coherence | the point is more than 0.5 degrees from the centre of its city | `FUERA_DE_CIUDAD` |
-| Battery | empty, negative or above 100 | `BATERIA_FUERA_DE_RANGO` |
-| Keys | vehicle, city or timestamp is missing | `CAMPO_VACIO` |
-| City | the city is not one of the five known cities | `CIUDAD_DESCONOCIDA` |
+| Rule | Rejected when | Label | Injected = quarantined |
+|---|---|---|---|
+| Speed | empty, negative or above 200 km/h | `VELOCIDAD_ABSURDA` | 243 |
+| Coordinates | empty or outside the range of the Earth | `COORDENADA_IMPOSIBLE` | 182 |
+| Coherence | the point is more than 0.5 degrees of latitude or longitude away from its city's centre | `FUERA_DE_CIUDAD` | 131 |
+| Battery | empty, negative or above 100 | `BATERIA_FUERA_DE_RANGO` | 191 |
+| Keys | vehicle, city or timestamp is missing | `CAMPO_VACIO` | 196 |
+| City | the city is not one of the five known cities | `CIUDAD_DESCONOCIDA` | 126 |
+
+## Design decisions
+
+- **Trigger.** Databricks serverless rejects processing-time triggers, so the Databricks run uses `Trigger.AvailableNow`: the generator runs first, then the stream drains. The local notebook runs producer and consumer concurrently with 5 s micro-batch triggers.
+- **Batch metrics.** Per-micro-batch row counts are read from the Delta transaction log, because `recentProgress` returns `numInputRows` as `None` on serverless.
+- **Serverless restrictions.** No `persist()` (`foreachBatch` recomputes the batch once per table) and `input_file_name()` is replaced by `_metadata.file_path`.
+- **At-least-once sinks.** `foreachBatch` guarantees at-least-once, not exactly-once. `informe.md` argues this does not matter in practice because every event has a unique `event_id` and duplicates are dropped upstream (10-minute watermark).
+- **Partitioning.** Silver is partitioned by city (5 values); partitioning by vehicle (1,590) would give thousands of folders with one tiny file each.
+- **Late data not exercised.** The generator injected 192 late events, but in the `AvailableNow` run the watermark dropped none of them, so late-data handling was not actually exercised. `informe.md` states this is a consequence of `AvailableNow` and must not be read as the watermark being harmless.
 
 ## Screenshot
 
@@ -75,31 +84,40 @@ Everything the pipeline generates (`lake/`, `rendimiento.png`) is recreated on e
 
 ## Run locally
 
-Requirements: Python 3 and Java 8, 11 or 17 (needed by PySpark 3.5).
+Requirements: Python 3.11 (the version the notebook was run on; Python 3.13+ is not supported by the pinned pyarrow 17) and Java 8, 11 or 17 (needed by PySpark 3.5).
 
 Windows (PowerShell):
 
 ```powershell
-python -m venv .venv
+py -3.11 -m venv .venv
+# Allow the activation script in this PowerShell session only (no admin needed)
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
 .venv\Scripts\Activate.ps1
 pip install -r requirements.txt
 ```
 
-macOS and Linux (use `python3` if `python` is missing or points to Python 2):
+macOS and Linux:
 
 ```bash
-python3 -m venv .venv
+python3.11 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-**Windows only: Hadoop binaries.** Spark on Windows needs `winutils.exe` and `hadoop.dll`. They are not committed (`.hadoop/` is gitignored), so download them once from [`cdarlint/winutils`](https://github.com/cdarlint/winutils/tree/master/hadoop-3.3.6/bin) (`hadoop-3.3.6/bin`) into `.hadoop\bin`, from the repository root:
+**Windows only: Hadoop binaries.** Spark on Windows needs `winutils.exe` and `hadoop.dll`. They are not committed (`.hadoop/` is gitignored), so download them once from [`cdarlint/winutils`](https://github.com/cdarlint/winutils/tree/7386986d5d8a079b5cd4464f4599766dd27e7d13/hadoop-3.3.6/bin) (`hadoop-3.3.6/bin`, pinned to a commit) into `.hadoop\bin`, from the repository root:
 
 ```powershell
 New-Item -ItemType Directory -Force .hadoop\bin
-Invoke-WebRequest https://raw.githubusercontent.com/cdarlint/winutils/master/hadoop-3.3.6/bin/winutils.exe -OutFile .hadoop\bin\winutils.exe
-Invoke-WebRequest https://raw.githubusercontent.com/cdarlint/winutils/master/hadoop-3.3.6/bin/hadoop.dll -OutFile .hadoop\bin\hadoop.dll
+Invoke-WebRequest https://raw.githubusercontent.com/cdarlint/winutils/7386986d5d8a079b5cd4464f4599766dd27e7d13/hadoop-3.3.6/bin/winutils.exe -OutFile .hadoop\bin\winutils.exe
+Invoke-WebRequest https://raw.githubusercontent.com/cdarlint/winutils/7386986d5d8a079b5cd4464f4599766dd27e7d13/hadoop-3.3.6/bin/hadoop.dll -OutFile .hadoop\bin\hadoop.dll
 ```
+
+Expected SHA-256 of the pinned files:
+
+- `winutils.exe`: `496a591eb1e67df2a620f710d529ba6ddfe1c19149e6647cc4e320bb0efd8553`
+- `hadoop.dll`: `d7ab36a68518748cef142be2da5069b4c763c2cd764c1d2e6ac48c7200405be3`
+
+Check them with `Get-FileHash .hadoop\bin\winutils.exe, .hadoop\bin\hadoop.dll -Algorithm SHA256`.
 
 The first code cell of `Entregable.ipynb` sets `HADOOP_HOME` to `.hadoop` in the project folder and puts `.hadoop\bin` on `PATH`. macOS and Linux need none of this.
 
@@ -131,7 +149,7 @@ Local, Windows:
 
 ## Data
 
-The seed comes from the [Vehicle Energy Dataset](https://github.com/gsoh/VED) (VED, University of Michigan, Apache-2.0): 27 real electric cars logged over OBD-II at 1 record per second in Ann Arbor, Michigan. It was prepared by keeping the vehicles that measure battery level and cleaning the records, which leaves 1,494,385 records from 1,590 trips. The generator then moves each trip to one of five Spanish cities, treats each trip as a separate vehicle and replays them 60 times faster than real time. Speed and battery level are never modified.
+The seed comes from the [Vehicle Energy Dataset](https://github.com/gsoh/VED) (VED, University of Michigan, Apache-2.0; license text in [`datos/LICENSE`](datos/LICENSE)): 27 real plug-in hybrid and electric cars (PHEV/EV) logged over OBD-II at 1 record per second in Ann Arbor, Michigan. It was prepared by keeping the vehicles that measure battery level and cleaning the records, which leaves 1,494,385 records from 1,590 trips. The generator then moves each trip to one of five Spanish cities, treats each trip as a separate vehicle and replays them 60 times faster than real time. Speed and battery level are never modified.
 
 Citation: G. Oh, D. J. LeBlanc, H. Peng, "Vehicle Energy Dataset (VED), A Large-scale Dataset for Vehicle Energy Consumption Research", IEEE Transactions on Intelligent Transportation Systems, 2020. [doi:10.1109/TITS.2020.3035596](https://doi.org/10.1109/TITS.2020.3035596)
 
@@ -141,4 +159,4 @@ Built as the optional Databricks exercise (Option A, real-time IoT telemetry and
 
 ## License
 
-Code: [MIT](LICENSE). Data: the seed is derived from VED and follows VED's Apache-2.0 license.
+Code: [MIT](LICENSE). Data: the seed is derived from VED and follows VED's Apache-2.0 license, included as [`datos/LICENSE`](datos/LICENSE).
