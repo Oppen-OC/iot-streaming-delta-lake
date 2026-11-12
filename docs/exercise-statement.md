@@ -37,6 +37,3 @@ You are required to select **one** of the three defined application paths below 
 *   [Delta Lake Documentation](https://docs.delta.io/latest/index.html) - Documentation for the Delta open storage format.
 *   [MLflow Documentation](https://mlflow.org/docs/latest/index.html) - Guide to tracking machine learning experiments and logging models.
 *   [Delta Live Tables (DLT) Guide](https://docs.databricks.com/en/delta-live-tables/index.html) - Declaring declarative data processing pipelines on Databricks.
-
----
-[⬅ Back to Module 4 README](./README.md)
